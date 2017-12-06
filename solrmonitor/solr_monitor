@@ -1,0 +1,200 @@
+#!/bin/bash
+######################################################################################################################################
+# SCRIPT  : This script when executed will monitor complete Solr Cloud Heath Check.
+# USAGE   : solr_monitor [Collection Name]
+#           NOTE: Property file should be presnt defining if cluster is secure and if yes the kerberos config.
+# VERSION : 1.1
+# DATED   : 18 November, 2017
+######################################################################################################################################
+
+#####################################################################################################
+# Initialization section
+#####################################################################################################
+scriptHm=$(cd $(dirname $0);pwd)
+colNm=$1
+
+echo "[`date`] Script home detected $scriptHm"
+if [ -f ${scriptHm}/solr_monitor.conf ] ; then
+        echo "[`date`] Proporty file identified, ${scriptHm}/solr_monitor.conf."
+else
+        echo "[`date`] Property file absent thus exiting ...!!!"
+        exit 1
+fi
+
+is_debug=$(grep ^solr.monitor.debug ${scriptHm}/solr_monitor.conf | awk -F"=" '{ print $2 }')
+mail_to=$(grep ^solr.monitor.admincontact ${scriptHm}/solr_monitor.conf | awk -F"=" '{ print $2 }')
+princ_nm=$(grep ^solr.monitor.admin ${scriptHm}/solr_monitor.conf | awk -F"=" '{ print $2 }')
+dmn_nm=$(grep ^solr.monitor.krbdomain ${scriptHm}/solr_monitor.conf | awk -F"=" '{ print $2 }')
+solr_hst=$(grep ^solr.monitor.cloudhosts ${scriptHm}/solr_monitor.conf | awk -F"=" '{ print $2 }')
+report_is=$(grep ^solr.monitor.report ${scriptHm}/solr_monitor.conf | awk -F"=" '{ print $2 }')
+sucs_mail=$(grep ^solr.mail.onsucess ${scriptHm}/solr_monitor.conf | awk -F"=" '{ print $2 }')
+report_fl=$scriptHm/history/solr.alert.log
+
+tmp_dir=$scriptHm/tmp
+solr_stat=$scriptHm/tmp/solr.stat.tmp.$$
+qryOpFile=$scriptHm/tmp/solr.qryexec.tmp.$$
+mail_fl=$scriptHm/tmp/solr.mail.tmp.$$
+KERB_FILE="/tmp/krb5cc_solr_keytab_"$$
+kinit -c ${KERB_FILE} -l 5d -k -t  ${scriptHm}/datastore/${princ_nm}.keytab ${princ_nm}@${dmn_nm}
+KRB5CCNAME="FILE:${KERB_FILE}"
+export KRB5CCNAME
+klist
+
+if [ "${is_debug}" == "enable" -o "${is_debug}" == "true" ] ; then
+        echo "INFO [$(date)] : Setting debug mode."
+        set -x
+fi
+
+echo "Mail from Host $(hostname) on $(date)." >> ${mail_fl}
+echo "" >> ${mail_fl}
+echo "Status of SolrCloud for Collection $colNm " >> ${mail_fl}
+echo "" >> ${mail_fl}
+echo "===========================================" >> ${mail_fl}
+echo "" >> ${mail_fl}
+
+#####################################################################################################
+# Monitor Section
+#####################################################################################################
+pingStat=1
+for htNm in `echo $solr_hst | tr "," "\n"`
+do
+	rm -f ${solr_stat}
+	/usr/bin/curl -s -i --negotiate -u : "http://${htNm}:8983/solr/zookeeper?detail=true&path=%2Fclusterstate.json" >> ${solr_stat} 2>> ${solr_stat}
+	comStat=$(echo $?)
+	grep -q "znode" ${solr_stat} 
+	grpStat=$(echo $?)
+	if [ $comStat -eq 0 -a $grpStat -eq 0 ] ; then
+		pingStat=0
+		break
+	fi
+	echo "Status: "
+	echo "======================================"
+	cat ${solr_stat}
+        echo "======================================"
+done
+if [ $pingStat -eq 1 ] ; then
+        echo "Issue: Cannot connect Solr Admin Service" >> ${mail_fl}
+        cat ${mail_fl} | mailx -r HadoopAdmin -s "ALERT: Issue in Solr Service on $(hostname) for Collection $colNm" ${mail_to}
+        rm -f $scriptHm/tmp/*.tmp.*
+        exit 1
+fi
+
+overAllStat=0
+col_str=$(cat $solr_stat | while read line; do echo $line; done | grep ^\"data\" | awk -F"\"$colNm\":{n" '{ print $2 }' | awk -F"routerSpec" '{ print $1 }')
+echo "======================================"
+echo "Collection Statistics:"
+echo "-----------------------"
+echo $col_str
+echo "======================================"
+countrSNmEnd=$(echo $col_str | awk -F"\"range\"" '{ print NF }')
+countrS=1
+while [ $countrS -lt $countrSNmEnd ] 
+do
+	shrdNm=$(echo $col_str | awk -vcolNm=$countrS -F"\"range\"" '{ print $colNm }'| awk '{ print $NF }' | awk -F: '{ print $1 }' | tr -d '"')
+	countrN=$(expr $countrS + 1)
+	shrd_conf=$(echo $col_str | awk -vsrdConf=$countrN -F"\"range\"" '{ print $srdConf }')
+	countrC=2
+	countrCNmEnd=$(echo $shrd_conf | awk -F"n \"core\":" '{ print NF }')
+	while [ $countrC -le $countrCNmEnd ] 
+	do
+		coreConf=$(echo $shrd_conf | awk -vcrConf=$countrC -F"n \"core\":" '{ print $crConf }')
+		crNm=$(echo $coreConf | awk -F, '{ print $1 }' | tr -d '"')
+		stCnt=$(expr $countrC - 1)
+		crState=$(echo $shrd_conf | awk -vcrStCnt=$stCnt -F"n \"core\":" '{ print $crStCnt }' | awk '{ print $NF }' | awk -F: '{ print $2 }' | awk -F, '{ print $1 }' | tr -d '"')
+                if [ "$crState" != "active" ] ; then
+                        overAllStat=1
+                fi
+		crUrl=$(echo $coreConf | awk '{ print $2 }' | awk -F: '{ print $2 }' | awk -F, '{ print $1 }' | tr -d '"')
+		qryStat=1
+		qryStatCntMxRry=3
+		chkCnt=1
+		while [ $chkCnt -le $qryStatCntMxRry ] ; do
+			strtm=$(date +%s)
+			/usr/bin/curl -s -i --negotiate -u : "http://${crUrl}:8983/solr/${crNm}/select?q=*%3A*&wt=json&indent=true" >> ${qryOpFile} 2>> ${qryOpFile}
+			if [ $? -eq 0 ] ; then
+				endtm=$(date +%s)
+				qryStat=0
+				break
+			fi
+			chkCnt=$(expr $chkCnt + 1)
+			sleep 30
+		done
+		if [ ${qryStat} -ne 0 ] ; then
+			qryStat="Fail"
+			qryTm=NA
+			overAllStat=2
+			cat ${qryOpFile}
+		else
+			qryTm=$(expr $endtm - $strtm)
+			grep -q numFound ${qryOpFile}
+			if [ $? -eq 0 ] ; then
+				qryStat="Success"
+			else
+                        	qryStat="Fail"
+				qryTm=NA
+				overAllStat=2
+				cat ${qryOpFile}
+			fi
+		fi
+		rm -f ${qryOpFile}
+                echo "Core Name: $crNm, Core State: $crState, Core URL: $crUrl , Query Status: $qryStat, Query Execution: $qryTm " >> ${mail_fl}
+                echo "" >> ${mail_fl}
+                countrC=$(expr $countrC + 1)
+		echo "[`date`] Core Name: $crNm, Core State: $crState, Core URL: $crUrl , Query Status: $qryStat, Query Execution: $qryTm "
+	done
+	countrS=$(expr $countrS + 1)
+done
+
+#####################################################################################################
+# Logging and ERROR reporting
+#####################################################################################################
+
+echo "[`date`] Logging execution summary."
+echo "[`date`] FINAL ERROR STRING: $overAllStat."
+
+if [ "${report_is}" == "yes" -o "${report_is}" == "YES" ] ; then
+	echo "[`date`] Reporting enabled. Thus will update report file."
+	if [ $overAllStat -eq 0 ] ; then
+		echo "[`date`] Current execution was successful."
+		echo "[`date`] :INFO: (OK)" >> ${hstry_log}
+	else
+		echo "[`date`] Problem detected in this execution."
+		tail -1 ${hstry_log} | grep ":INFO:"
+		if [ $? -eq 0 ] ; then
+			echo "[`date`] Last execution was successful."
+			if [ $overAllStat -eq 1 ] ; then
+				echo "[`date`] :ERROR: SOLRCLOUDSRVICE" >> ${hstry_log}
+			elif [ $overAllStat -eq 2 ] ; then
+				echo "[`date`] :ERROR: SOLRQUERY" >> ${hstry_log}
+			fi
+		else
+			echo "[`date`] Last execution was also unsuccessful."
+		fi
+	fi
+fi
+
+#####################################################################################################
+# Mailing Section
+#####################################################################################################
+
+if [ $overAllStat -eq 1 ] ; then
+        echo "[`date`] Issue: Issue in Solr Services. See Report above." >> ${mail_fl}
+        cat ${mail_fl} | mailx -r HadoopAdmin -s "ALERT: Issue in Solr Service on $(hostname) for Collection $colNm" ${mail_to}
+elif [ $overAllStat -eq 2 ] ; then
+        echo "[`date`] Issue: Issue in Solr Query. See Report above." >> ${mail_fl}
+        cat ${mail_fl} | mailx -r HadoopAdmin -s "WARN: Issue in Solr Service on $(hostname) for Collection $colNm" ${mail_to}
+else
+	echo "[`date`] No issue detected in this execution."
+	if [ "${sucs_mail}" == "yes" ] ; then
+		cat ${mail_fl} | mailx -r HadoopAdmin -s "INFO: Solr Service status on $(hostname) for Collection $colNm" ${mail_to}
+	fi
+fi
+
+#####################################################################################################
+# Cleanup
+#####################################################################################################
+
+rm -f $tmp_dir/*.tmp.*
+rm -f ${KERB_FILE}
+
+echo "[`date`] Execution Completed."
