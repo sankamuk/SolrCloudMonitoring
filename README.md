@@ -1,4 +1,3 @@
-*** WORK IN PROGRESS ***
 
 # SolrCloudMonitoring
 This tool helps monitor Solr Cloud
@@ -44,6 +43,7 @@ The tool does different type of validation and gives you a consolidated health r
         a. Monitor Secured Solr Cloud Cores. Reports if any has a non active state.
         b. Monitor query response of your Cloud. You can set your expected response time threshold.
         c. Since the tool works per Collection thus giving you flexibility to monitor only the collection you you want to monitor(critical for your environment).
+        d. Generate Alert Mail and also has the ability to integrate with your exeisting Incident Management Setup.
 
 ### 1.3. Scope of monitoring
 
@@ -93,7 +93,7 @@ The tool can be executed by
 
 ### 2.4. Toubleshooting steps
 
-The script has been build to log fairly verbose log level, so that any issue if occured can be identified using the log only. The log for the two execution type supported is stated below:
+The script has been build to log fairly verbose log level once you enable debug on, so that any issue if occured can be identified using the log only. The log for the each collection monitored is stated below:
 
 SCOPE | LOCATION | LOG NAME
 --- | --- | ---
